@@ -1,51 +1,135 @@
 from flask import Blueprint, request, jsonify, session
 from utils.db import db
 from flask_bcrypt import Bcrypt
+from bson import ObjectId
+from datetime import datetime
 
 auth = Blueprint('auth', __name__)
 bcrypt = Bcrypt()
 
 # Use the 'resident' collection inside 'gated_community' database
-residents_collection = db["resident"]
+residents_collection = db["Residents"]
 
 # ---------------- REGISTER ----------------
 @auth.route("/register", methods=["POST"])
 def register():
     data = request.get_json()
-    username = data.get("username")
-    password = data.get("password")
-    role = data.get("role", "resident")  # default role
 
-    if not username or not password:
-        return jsonify({"message": "Username and password are required"}), 400
+    # ✅ Extract main resident info
+    full_name = data.get("fullName")
+    gender = data.get("gender")
+    dob = data.get("dob")
+    phone = data.get("phone")
+    alternate_number = data.get("alternateNumber")
+    email = data.get("email")
+    aadhar = data.get("aadhar")
+    address = data.get("address")
+    occupation = data.get("occupation")
+    ownership_type = data.get("ownershipType")
+    tenant_start = data.get("tenantStartDate")
+    tenant_end = data.get("tenantEndDate")
+    block = data.get("block")
+    flat_number = data.get("flatNumber")
+    floor = data.get("floor")
+    parking_slots = data.get("parkingSlots")
+    vehicles = data.get("vehicles")
+    ownership_status = data.get("ownershipStatus")
 
-    if residents_collection.find_one({"username": username}):
-        return jsonify({"message": "Username already exists"}), 400
+    # ✅ Family and emergency details
+    family_members = data.get("familyMembers", [])
+    emergency_name = data.get("emergencyName")
+    emergency_number = data.get("emergencyNumber")
+    emergency_relation = data.get("emergencyRelation")
 
-    hashed_pw = bcrypt.generate_password_hash(password).decode("utf-8")
+    role = data.get("role", "resident")
 
-    residents_collection.insert_one({
-        "username": username,
-        "password": hashed_pw,
-        "role": role
+    # 🔹 Basic validation
+    if not full_name or not phone or not email:
+        return jsonify({"message": "Full name, phone, and email are required"}), 400
+
+    # 🔹 Prevent duplicate users
+    existing_user = residents_collection.find_one({
+        "$or": [
+            {"phone": phone},
+            {"email": email}
+        ]
     })
+    if existing_user:
+        return jsonify({"message": "User with same phone or email already exists"}), 400
 
-    return jsonify({"message": f"User '{username}' registered successfully as {role}!"}), 201
+    # 🔹 Insert data into MongoDB
+    resident_data = {
+        "fullName": full_name,
+        "gender": gender,
+        "dob": dob,
+        "phone": phone,
+        "alternateNumber": alternate_number,
+        "email": email,
+        "aadhar": aadhar,
+        "address": address,
+        "occupation": occupation,
+        "ownershipType": ownership_type,
+        "tenantStartDate": tenant_start,
+        "tenantEndDate": tenant_end,
+        "block": block,
+        "flatNumber": flat_number,
+        "floor": floor,
+        "parkingSlots": parking_slots,
+        "vehicles": vehicles,
+        "ownershipStatus": ownership_status,
+        "familyMembers": family_members,
+        "emergencyContact": {
+            "name": emergency_name,
+            "number": emergency_number,
+            "relation": emergency_relation
+        },
+        "role": role,
+        "createdAt": datetime.utcnow()
+    }
+
+    result = residents_collection.insert_one(resident_data)
+
+    return jsonify({
+        "message": f"Resident '{full_name}' registered successfully!",
+        "residentId": str(result.inserted_id),
+        "role": role
+    }), 201
+
 
 
 # ---------------- LOGIN ----------------
 @auth.route("/login", methods=["POST"])
 def login():
+    print("✅ Login API hit!")
     data = request.get_json()
-    username = data.get("username")
+    identifier = data.get("identifier")  # can be email or phone
     password = data.get("password")
 
-    user = residents_collection.find_one({"username": username})
-    if not user or not bcrypt.check_password_hash(user["password"], password):
-        return jsonify({"message": "Invalid username or password"}), 401
+    if not identifier or not password:
+        return jsonify({"message": "Email/Phone and password are required"}), 400
 
-    session["user"] = {"username": user["username"], "role": user["role"]}
-    return jsonify({"message": f"Welcome {username}!", "role": user["role"]}), 200
+    # Find user by email or phone
+    user = residents_collection.find_one({
+        "$or": [
+            {"email": identifier},
+            {"phone": identifier}
+        ]
+    })
+
+    if not user or not bcrypt.check_password_hash(user["password"], password):
+        return jsonify({"message": "Invalid email/phone or password"}), 401
+
+    session["user"] = {
+        "email": user.get("email"),
+        "phone": user.get("phone"),
+        "role": user.get("role")
+    }
+
+    return jsonify({
+        "fullname": user.get("fullname"),
+        "role": user.get("role")
+    }), 200
+
 
 
 # ---------------- LOGOUT ----------------
