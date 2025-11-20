@@ -1,0 +1,71 @@
+from flask import request, jsonify
+from pymongo import MongoClient
+from bson import ObjectId
+from . import residentsbookings_bp
+
+# ---------------- DATABASE -----------------
+client = MongoClient("mongodb://localhost:27017/")
+db = client["Dhanova"]
+bookings_collection = db["resident_bookings"]
+
+def serialize(b):
+    b["_id"] = str(b["_id"])
+    return b
+
+
+# ------------ GET ALL BOOKINGS --------------
+@residentsbookings_bp.route("/get", methods=["GET"])
+def get_bookings():
+    data = list(bookings_collection.find())
+    return jsonify([serialize(b) for b in data])
+
+
+# ------------ ADD NEW BOOKING ---------------
+@residentsbookings_bp.route("/add", methods=["POST"])
+def add_booking():
+    new_booking = request.json
+
+    new_booking["status"] = "Pending"
+
+    result = bookings_collection.insert_one(new_booking)
+    new_booking["_id"] = str(result.inserted_id)
+
+    return jsonify(new_booking), 201
+
+
+# ------------ UPDATE BOOKING ----------------
+@residentsbookings_bp.route("/update/<id>", methods=["PUT"])
+def update_booking(id):
+    data = request.json
+    bookings_collection.update_one(
+        {"_id": ObjectId(id)},
+        {"$set": data}
+    )
+    return jsonify({"message": "Booking updated successfully"})
+
+
+# ------------ APPROVE BOOKING ---------------
+@residentsbookings_bp.route("/approve/<id>", methods=["PATCH"])
+def approve_booking(id):
+    bookings_collection.update_one(
+        {"_id": ObjectId(id)},
+        {"$set": {"status": "Approved"}}
+    )
+    return jsonify({"message": "Booking approved"})
+
+
+# ------------ REJECT BOOKING ----------------
+@residentsbookings_bp.route("/reject/<id>", methods=["PATCH"])
+def reject_booking(id):
+    bookings_collection.update_one(
+        {"_id": ObjectId(id)},
+        {"$set": {"status": "Rejected"}}
+    )
+    return jsonify({"message": "Booking rejected"})
+
+
+# ------------ DELETE BOOKING ----------------
+@residentsbookings_bp.route("/delete/<id>", methods=["DELETE"])
+def delete_booking(id):
+    bookings_collection.delete_one({"_id": ObjectId(id)})
+    return jsonify({"message": "Booking deleted"})
