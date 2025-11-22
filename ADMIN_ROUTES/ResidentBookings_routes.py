@@ -1,12 +1,11 @@
-from flask import request, jsonify
-from pymongo import MongoClient
+from flask import Blueprint, request, jsonify, session
+from utils.db import db
 from bson import ObjectId
-from . import residentsbookings_bp
 
-# ---------------- DATABASE -----------------
-client = MongoClient("mongodb://localhost:27017/")
-db = client["Dhanova"]
+residentsbookings = Blueprint('residentsbookings', __name__)
 bookings_collection = db["resident_bookings"]
+
+
 
 def serialize(b):
     b["_id"] = str(b["_id"])
@@ -14,14 +13,14 @@ def serialize(b):
 
 
 # ------------ GET ALL BOOKINGS --------------
-@residentsbookings_bp.route("/get", methods=["GET"])
+@residentsbookings.route("/get", methods=["GET"])
 def get_bookings():
     data = list(bookings_collection.find())
     return jsonify([serialize(b) for b in data])
 
 
 # ------------ ADD NEW BOOKING ---------------
-@residentsbookings_bp.route("/add", methods=["POST"])
+@residentsbookings.route("/add", methods=["POST"])
 def add_booking():
     new_booking = request.json
 
@@ -34,7 +33,7 @@ def add_booking():
 
 
 # ------------ UPDATE BOOKING ----------------
-@residentsbookings_bp.route("/update/<id>", methods=["PUT"])
+@residentsbookings.route("/update/<id>", methods=["PUT"])
 def update_booking(id):
     data = request.json
     bookings_collection.update_one(
@@ -45,7 +44,7 @@ def update_booking(id):
 
 
 # ------------ APPROVE BOOKING ---------------
-@residentsbookings_bp.route("/approve/<id>", methods=["PATCH"])
+@residentsbookings.route("/approve/<id>", methods=["PATCH"])
 def approve_booking(id):
     bookings_collection.update_one(
         {"_id": ObjectId(id)},
@@ -53,9 +52,8 @@ def approve_booking(id):
     )
     return jsonify({"message": "Booking approved"})
 
-
 # ------------ REJECT BOOKING ----------------
-@residentsbookings_bp.route("/reject/<id>", methods=["PATCH"])
+@residentsbookings.route("/reject/<id>", methods=["PATCH"])
 def reject_booking(id):
     bookings_collection.update_one(
         {"_id": ObjectId(id)},
@@ -65,7 +63,7 @@ def reject_booking(id):
 
 
 # ------------ DELETE BOOKING ----------------
-@residentsbookings_bp.route("/delete/<id>", methods=["DELETE"])
+@residentsbookings.route("/delete/<id>", methods=["DELETE"])
 def delete_booking(id):
     bookings_collection.delete_one({"_id": ObjectId(id)})
     return jsonify({"message": "Booking deleted"})

@@ -2,7 +2,7 @@ from flask import Blueprint, request, jsonify, session
 from utils.db import db
 from flask_bcrypt import Bcrypt
 from bson import ObjectId
-from datetime import datetime
+from datetime import datetime ,timedelta
 from bson import errors as bson_errors
 from utils.cloudinary_helper import upload_to_cloudinary
 from config import CLOUDINARY_CONFIG  
@@ -10,6 +10,8 @@ import uuid
 import traceback
 import json
 from flask import session
+from .mail_utils import generate_otp, send_email
+import threading
 
 
 auth = Blueprint('auth', __name__)
@@ -18,14 +20,10 @@ users_collection = db["users"]
 
 adminevents = Blueprint("adminevents", __name__)
 events_collection = db["AdminEvents"]
+otps_collection = db["otps"]
 
-# ✅ Helper function to generate unique event IDs
-def generate_event_id(event_title):
-    """Generate a unique Event ID like EVTXYZ20251107123045"""
-    prefix = "EVT"
-    title_part = ''.join(filter(str.isalnum, event_title[:3].upper()))
-    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    return f"{prefix}{title_part}{timestamp}"
+
+
 
 # Function to generate resident id
 def generate_resident_id(flat_number, phone):
@@ -43,6 +41,210 @@ def generate_resident_id(flat_number, phone):
             return None
     except Exception as e:
         raise ValueError(f"Error generating resident ID: {str(e)}")
+
+
+
+
+
+# ---------------- LOGIN ----------------
+@auth.route("/login", methods=["POST"])
+def login():
+    print("✅ Login API hit!")
+    data = request.get_json()
+    print("🧠 Received data:", data)
+    email_or_phone = data.get("emailOrPhone")
+    password = data.get("password")
+
+    if not email_or_phone or not password:
+        return jsonify({"message": "Email/Phone and password are required"}), 400
+
+    # 🔍 Find user by email or phone
+    user = users_collection.find_one({
+        "$or": [
+            {"email": email_or_phone},
+            {"phone": email_or_phone}
+        ]
+    })
+
+    if not user or not bcrypt.check_password_hash(user["password"], password):
+        return jsonify({"message": "Invalid email/phone or password"}), 401
+
+    # ✅ Store user in session (optional)
+    session["user"] = {
+        "email": user.get("email"),
+        "role": user.get("role"),
+        "fullname": user.get("fullname")
+    }
+
+    # ✅ Return structured user info
+    return jsonify({
+        "message": "Login successful",
+        "user": {
+            "fullname": user.get("fullname"),
+            "email": user.get("email"),
+            "role": user.get("role")
+        }
+    }), 200
+
+
+# ---------------- LOGOUT ----------------
+@auth.route("/logout", methods=["POST"])
+def logout():
+    """Clears user session."""
+    session.pop("user", None)
+    return jsonify({"message": "Logged out successfully"}), 200
+
+
+@auth.route("/create", methods=["POST"])
+def signup_user():
+    data = request.get_json()
+
+    firstname = data.get("Firstname")
+    lastname = data.get("Lastname")
+    email = data.get("Email")
+    password = data.get("Password")
+    phone = data.get("phone")
+    Address=data.get("Address")
+    Bloodgroup=data.get("Bloodgroup")
+    Aadhaar=data.get("Aadhaar")
+    PAN=data.get("PAN")
+
+    # Validate required fields
+    if not firstname or not lastname or not email or not password or not phone:
+        return jsonify({"message": "All fields are required"}), 400
+
+    if len(password) < 6:
+        return jsonify({"message": "Password must be at least 6 characters"}), 400
+
+    
+
+    # Check if email exists
+    if users_collection.find_one({"email": email.lower()}):
+        return jsonify({"message": "Email already registered"}), 400
+
+    hashed_password = bcrypt.generate_password_hash(password).decode("utf-8")
+
+    user = {
+        "firstname": firstname,
+        "lastname": lastname,
+        "fullname": f"{firstname} {lastname}",
+        "email": email.lower(),
+        "password": hashed_password,
+        "phone": phone,
+        "Address":Address,
+        "Bloodgroup":Bloodgroup,
+        "Aadhaar":Aadhaar,
+        "PAN":PAN,
+
+        "role": "admin"     # Recommended default
+    }
+
+    users_collection.insert_one(user)
+
+    return jsonify({"message": "Signup successful!"}), 201
+
+
+
+
+#------------send otp----------------
+@auth.route("/send-otp", methods=["POST"])
+def send_otp():
+    data = request.get_json()
+    email = data.get("email", "").lower()
+
+    if not email:
+        return jsonify({"message": "Email is required"}), 400
+
+    user = users_collection.find_one({"email": email})
+    if not user:
+        return jsonify({"message": "No account found"}), 404
+
+    fullname = user.get("fullname", "")
+    otp = generate_otp()
+    now = datetime.utcnow()
+
+    ordered_fields = {
+        "email": email,
+        "fullname": fullname,
+        "otp": otp,
+        "expires_at": now + timedelta(minutes=5)
+    }
+
+    otps_collection.replace_one({"email": email}, ordered_fields, upsert=True)
+
+    # 🚀 Send email in background (non-blocking)
+    threading.Thread(target=send_email, args=(email, otp)).start()
+
+    # 🚀 Return immediately (frontend will load OTP screen instantly)
+    return jsonify({"message": "OTP sent"}), 200
+
+
+
+
+
+
+#-----------------verify otp--------------------
+@auth.route("/verify-otp", methods=["POST"])
+def verify_otp():
+    data = request.get_json()
+    email = data.get("email", "").lower()
+    otp = data.get("otp")
+
+    otp_entry = otps_collection.find_one({"email": email})
+
+    if not otp_entry:
+        return jsonify({"message": "OTP not generated"}), 400
+
+    now = datetime.utcnow()
+
+    # Expired? delete it
+    if now > otp_entry["expires_at"]:
+        otps_collection.delete_one({"email": email})
+        return jsonify({"message": "OTP expired"}), 400
+
+    # Invalid OTP
+    if otp_entry["otp"] != otp:
+        return jsonify({"message": "Invalid OTP"}), 400
+
+    return jsonify({"message": "OTP verified"}), 200
+
+
+
+#-------------reset password------------------------
+@auth.route("/reset-password", methods=["POST"])
+def reset_password():
+    data = request.get_json()
+    email = data.get("email", "").lower()
+    new_password = data.get("new_password")
+
+    hashed_pw = bcrypt.generate_password_hash(new_password).decode("utf-8")
+
+    # Update password
+    users_collection.update_one(
+        {"email": email},
+        {"$set": {"password": hashed_pw}}
+    )
+
+    # Delete OTP after reset
+    otps_collection.delete_one({"email": email})
+
+    return jsonify({"message": "Password reset successful"}), 200
+
+
+
+# ---------------- CHECK SESSION ----------------
+@auth.route("/check-session", methods=["GET"])
+def check_session():
+    """Check if a user session exists."""
+    user = session.get("user")
+    if not user:
+        return jsonify({"message": "No active session"}), 401
+    return jsonify({
+        "username": user.get("email") or user.get("phone"),
+        "role": user["role"],
+        "message": "Session active"
+    }), 200
+
 
 
 
@@ -236,353 +438,14 @@ def register():
 
 
 
-# ---------------- LOGIN ----------------
-@auth.route("/login", methods=["POST"])
-def login():
-    print("✅ Login API hit!")
-    data = request.get_json()
-    print("🧠 Received data:", data)
-    email_or_phone = data.get("emailOrPhone")
-    password = data.get("password")
 
-    if not email_or_phone or not password:
-        return jsonify({"message": "Email/Phone and password are required"}), 400
 
-    # 🔍 Find user by email or phone
-    user = users_collection.find_one({
-        "$or": [
-            {"email": email_or_phone},
-            {"phone": email_or_phone}
-        ]
-    })
 
-    if not user or not bcrypt.check_password_hash(user["password"], password):
-        return jsonify({"message": "Invalid email/phone or password"}), 401
 
-    # ✅ Store user in session (optional)
-    session["user"] = {
-        "email": user.get("email"),
-        "role": user.get("role"),
-        "fullname": user.get("fullname")
-    }
 
-    # ✅ Return structured user info
-    return jsonify({
-        "message": "Login successful",
-        "user": {
-            "fullname": user.get("fullname"),
-            "email": user.get("email"),
-            "role": user.get("role")
-        }
-    }), 200
 
 
-# ---------------- LOGOUT ----------------
-@auth.route("/logout", methods=["POST"])
-def logout():
-    """Clears user session."""
-    session.pop("user", None)
-    return jsonify({"message": "Logged out successfully"}), 200
 
-
-# ---------------- CHECK SESSION ----------------
-@auth.route("/check-session", methods=["GET"])
-def check_session():
-    """Check if a user session exists."""
-    user = session.get("user")
-    if not user:
-        return jsonify({"message": "No active session"}), 401
-    return jsonify({
-        "username": user.get("email") or user.get("phone"),
-        "role": user["role"],
-        "message": "Session active"
-    }), 200
-
-
-# ---------------- ADMIN: VIEW ALL USERS ----------------
-@auth.route("/users", methods=["GET"])
-def get_all_users():
-    """Admins can view all registered users."""
-    user = session.get("user")
-    if not user or user["role"] != "admin":
-        return jsonify({"message": "Access denied! Admins only."}), 403
-
-    users = list(users_collection.find({}, {"_id": 0, "password": 0}))
-    return jsonify({"users": users}), 200
-
-
-
-#-----------------Edit resident----------------------
-@auth.route("/residents/<resident_id>", methods=["PUT"])
-def update_resident_details(resident_id):
-    """Update resident profile details (Full Name, Phone, etc.)"""
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"message": "No data received"}), 400
-
-        print(f"➡️ Updating resident: {resident_id}")
-        print(f"➡️ Data received: {data}")
-
-        # ✅ Get currently logged-in user from session
-        updated_by = "System"
-        if "user" in session:
-            user = session.get("user")
-            updated_by = (
-                user.get("email") or 
-                user.get("username") or 
-                user.get("phone") or 
-                "Unknown"
-            )
-
-        # ✅ Validate residentId format if needed
-        # (If residentId is a string like R-101, skip ObjectId conversion)
-        result = users_collection.update_one(
-            {"residentId": resident_id},  # match by your unique residentId
-            {"$set": {
-                **data,
-                "updatedBy": updated_by,   # 👈 add this field
-                "updatedAt": datetime.utcnow()  # 👈 track timestamp
-            }}
-        )
-
-        if result.matched_count == 0:
-            return jsonify({"message": "Resident not found"}), 404
-
-        print(f"✅ Resident updated successfully by {updated_by}")
-        return jsonify({"message": f"Resident updated successfully by {updated_by}!"}), 200
-
-    except Exception as e:
-        print("❌ Error updating resident:", e)
-        traceback.print_exc()
-        return jsonify({"message": "Server error while updating resident"}), 500
-
-
-
-
-# ============================================================
-# ✅ 2️⃣ UPDATE RESIDENT STATUS (Verified / Unverified)
-# ============================================================
-@auth.route("/residents/update-status/<resident_id>", methods=["PUT"])
-def update_resident_status(resident_id):
-    """Update resident verification status"""
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"message": "Missing request body"}), 400
-
-        new_status = data.get("status")
-        if new_status not in ["verified", "unverified"]:
-            return jsonify({"message": "Invalid status value"}), 400
-
-        print(f"➡️ Updating status for residentId: {resident_id} to {new_status}")
-
-        # 🔧 No ObjectId conversion here — use custom residentId
-        result = users_collection.update_one(
-            {"residentId": resident_id},
-            {"$set": {"status": new_status}}
-        )
-
-        if result.matched_count == 0:
-            print("❌ Resident not found in DB")
-            return jsonify({"message": "Resident not found"}), 404
-
-        print(f"✅ Status updated to '{new_status}'")
-        return jsonify({"message": f"Resident status updated to '{new_status}'"}), 200
-
-    except Exception as e:
-        print("❌ Error updating resident status:", e)
-        traceback.print_exc()
-        return jsonify({"message": "Server error while updating resident status"}), 500
-
-
-
-# ============================================================
-# ✅ 3️⃣ DELETE RESIDENT
-# ============================================================
-@auth.route("/residents/<residentId>", methods=["DELETE"])
-def delete_resident(residentId):
-    """Delete a resident by residentId"""
-    try:
-        print(f"➡️ Attempting to delete resident (residentId): {residentId}")
-
-        result = users_collection.delete_one({"residentId": residentId})
-
-        if result.deleted_count == 0:
-            print("❌ Resident not found in DB")
-            return jsonify({"message": "Resident not found"}), 404
-
-        print(f"✅ Resident {residentId} deleted successfully")
-        return jsonify({"message": "Resident deleted successfully"}), 200
-
-    except Exception as e:
-        print("❌ Error deleting resident:", e)
-        traceback.print_exc()
-        return jsonify({"message": "Server error while deleting resident"}), 500
-
-
-
-
-
-# ---------------- CREATE ADMIN EVENT ----------------
-@adminevents.route("/create", methods=["POST"])
-def create_event():
-    data = request.get_json()
-
-    event_title = data.get("event_title")
-    description = data.get("description")
-    event_date = data.get("event_date")
-    event_time = data.get("event_time")
-    requires_hall = data.get("requires_community_hall", False)
-
-    # ✅ Get creator email from session
-    created_by = "System"
-    if "user" in session:
-        creator = session.get("user")
-        created_by = creator.get("email", "Unknown")
-
-    # Validation
-    if not event_title or not event_date or not event_time:
-        return jsonify({"error": "Missing required fields"}), 400
-
-    # ✅ Generate custom event_id
-    event_id = generate_event_id(event_title)
-
-    # ✅ Build event document
-    event_data = {
-        "event_id": event_id,
-        "event_title": event_title,
-        "description": description,
-        "event_date": event_date,
-        "event_time": event_time,
-        "requires_community_hall": requires_hall,
-        "created_by": created_by,
-        "created_at": datetime.utcnow(),
-        "updated_by": created_by,
-        "updated_at": datetime.utcnow(),
-        "status": "pending",
-    }
-
-    if requires_hall:
-        event_data["hall_name"] = data.get("hall_name", "")
-        event_data["hall_timings"] = data.get("hall_timings", "")
-        event_data["notes"] = data.get("notes", "")
-
-    result = events_collection.insert_one(event_data)
-
-    return jsonify({
-        "message": "Admin event created successfully",
-        "event_id": event_id
-    }), 201
-
-
-# ---------------- GET ALL EVENTS ----------------
-@adminevents.route("/list", methods=["GET"])
-def get_all_events():
-    events = list(events_collection.find())
-    for event in events:
-        event["_id"] = str(event["_id"])
-    return jsonify({
-        "total_events": len(events),
-        "events": events
-    }), 200
-
-
-# ---------------- GET EVENT BY CUSTOM ID ----------------
-@adminevents.route("/<event_id>", methods=["GET"])
-def get_event(event_id):
-    try:
-        # First try custom event_id
-        event = events_collection.find_one({"event_id": event_id})
-
-        # Fallback: Try ObjectId
-        if not event:
-            try:
-                object_id = ObjectId(event_id)
-                event = events_collection.find_one({"_id": object_id})
-            except bson_errors.InvalidId:
-                return jsonify({"error": "Invalid event ID format"}), 400
-
-        if not event:
-            return jsonify({"error": "Event not found"}), 404
-
-        event["_id"] = str(event["_id"])
-        return jsonify(event), 200
-
-    except Exception as e:
-        print("❌ Error fetching event:", e)
-        return jsonify({"error": "Server error fetching event"}), 500
-
-
-# ---------------- UPDATE EVENT BY CUSTOM ID ----------------
-@adminevents.route("/update/<event_id>", methods=["PUT"])
-def update_event(event_id):
-    try:
-        data = request.get_json()
-
-        # ✅ Get updater email from session
-        updated_by = "System"
-        if "user" in session:
-            user = session.get("user")
-            updated_by = user.get("email", "Unknown")
-
-        data["updated_at"] = datetime.utcnow()
-        data["updated_by"] = updated_by
-
-        # Try to update by event_id first
-        result = events_collection.update_one(
-            {"event_id": event_id},
-            {"$set": data}
-        )
-
-        # Fallback: Try ObjectId if no match
-        if result.matched_count == 0:
-            try:
-                object_id = ObjectId(event_id)
-                result = events_collection.update_one(
-                    {"_id": object_id}, {"$set": data}
-                )
-            except bson_errors.InvalidId:
-                return jsonify({"error": "Invalid event ID format"}), 400
-
-        if result.matched_count == 0:
-            return jsonify({"error": "Event not found"}), 404
-
-        return jsonify({"message": "Event updated successfully"}), 200
-
-    except Exception as e:
-        print("❌ Error updating event:", e)
-        return jsonify({"error": "Server error updating event"}), 500
-
-
-# ---------------- DELETE EVENT BY CUSTOM ID ----------------
-@adminevents.route("/delete/<event_id>", methods=["DELETE"])
-def delete_event(event_id):
-    try:
-        print(f"➡️ Attempting to delete event with ID: {event_id}")
-
-        # Try delete by custom event_id first
-        result = events_collection.delete_one({"event_id": event_id})
-
-        # Fallback: Try by MongoDB ObjectId
-        if result.deleted_count == 0:
-            try:
-                object_id = ObjectId(event_id)
-                result = events_collection.delete_one({"_id": object_id})
-            except bson_errors.InvalidId:
-                print("❌ Invalid event ID format")
-                return jsonify({"error": "Invalid event ID format"}), 400
-
-        if result.deleted_count == 0:
-            print("❌ Event not found")
-            return jsonify({"error": "Event not found"}), 404
-
-        print(f"✅ Event {event_id} deleted successfully")
-        return jsonify({"message": "Event deleted successfully"}), 200
-
-    except Exception as e:
-        print("❌ Error deleting event:", e)
-        return jsonify({"error": "Server error while deleting event"}), 500
 
 
 

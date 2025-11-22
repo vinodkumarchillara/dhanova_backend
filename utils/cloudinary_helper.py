@@ -1,23 +1,26 @@
 import cloudinary
 import cloudinary.uploader
 
-
-def upload_to_cloudinary(file, folder_name):
+def upload_to_cloudinary(file, resident_id, subfolder):
     """
-    Uploads a file to Cloudinary under a specific folder.
-    Returns the secure URL if successful, else None.
+    Upload a file to Cloudinary in this structure:
+    residents/<resident_id>/<subfolder>/
+    Returns a dict with URL and public_id if successful.
     """
     if not file:
-        return None  # No file uploaded
+        return None
 
     try:
+        folder_path = f"residents/{resident_id}/{subfolder}"
         upload_result = cloudinary.uploader.upload(
             file,
-            folder=folder_name,
-            resource_type="auto"  # auto-detects image/pdf/video, etc.
+            folder=folder_path,
+            resource_type="auto"  # auto-detect image/pdf/video/etc
         )
-        return upload_result.get("secure_url")
-
+        return {
+            "url": upload_result.get("secure_url"),
+            "public_id": upload_result.get("public_id")
+        }
     except Exception as e:
-        print(f"❌ Cloudinary upload failed for folder '{folder_name}': {str(e)}")
+        print(f"❌ Cloudinary upload failed for {folder_path}: {str(e)}")
         return None
