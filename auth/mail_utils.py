@@ -29,3 +29,4 @@ def send_email(to_email, otp):
     except Exception as e:
         print("Email Error:", e)
         return False
+

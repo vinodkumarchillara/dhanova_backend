@@ -1,183 +1,227 @@
 from flask import Blueprint, request, jsonify, session
 from utils.db import db
-from datetime import datetime ,timedelta
+from datetime import datetime
 from bson import ObjectId
-from bson import errors as bson_errors
 
 adminevents = Blueprint('adminevents', __name__)
+
 events_collection = db["AdminEvents"]
+resident_bookings = db["resident_bookings"]
 
 
-
-# ✅ Helper function to generate unique event IDs
-def generate_event_id(event_title):
-    """Generate a unique Event ID like EVTXYZ20251107123045"""
+# ------------------ Helper: Generate Unique Event ID ------------------
+def generate_event_id(title):
     prefix = "EVT"
-    title_part = ''.join(filter(str.isalnum, event_title[:3].upper()))
-    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    return f"{prefix}{title_part}{timestamp}"
+    clean = ''.join(filter(str.isalnum, title[:3].upper()))
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    return f"{prefix}{clean}{ts}"
 
 
-# ---------------- CREATE ADMIN EVENT ----------------
+# ============================================================================
+# ✅ CREATE EVENT (SAFE + UNIFIED)
+# ============================================================================
 @adminevents.route("/create", methods=["POST"])
 def create_event():
     data = request.get_json()
 
-    event_title = data.get("event_title")
-    description = data.get("description")
-    event_date = data.get("event_date")
-    event_time = data.get("event_time")
-    requires_hall = data.get("requires_community_hall", False)
+    required = ["title", "eventStartDate", "eventStartTime", "eventEndTime"]
+    for f in required:
+        if not data.get(f):
+            return jsonify({"error": f"{f} is required"}), 400
 
-    # ✅ Get creator email from session
-    created_by = "System"
-    if "user" in session:
-        creator = session.get("user")
-        created_by = creator.get("email", "Unknown")
+    is_multi = data.get("isMultiDay", False)
+    requires_hall = data.get("requiresHall", False)
 
-    # Validation
-    if not event_title or not event_date or not event_time:
-        return jsonify({"error": "Missing required fields"}), 400
+    start_date = data["eventStartDate"]
+    end_date = data.get("eventEndDate") if is_multi else start_date
 
-    # ✅ Generate custom event_id
-    event_id = generate_event_id(event_title)
+    created_by = session.get("user", {}).get("email", "System")
 
-    # ✅ Build event document
-    event_data = {
+    # ---------------- HALL VALIDATION ----------------
+    if requires_hall:
+
+        hall_start = data.get("hallStartDate") or start_date
+        hall_end = data.get("hallEndDate") or end_date
+
+        if not data.get("hallName"):
+            return jsonify({"error": "hallName required"}), 400
+
+        if not data.get("hallStartTime") or not data.get("hallEndTime"):
+            return jsonify({"error": "Hall times required"}), 400
+
+        # Check admin events conflict
+        conflict_admin = events_collection.find_one({
+            "requiresHall": True,
+            "hallName": data["hallName"],
+            "eventStartDate": {"$lte": hall_end},
+            "eventEndDate": {"$gte": hall_start}
+        })
+
+        if conflict_admin:
+            return jsonify({
+                "error": "Hall booked by admin",
+                "eventTitle": conflict_admin["title"]
+            }), 409
+
+        # Check resident booking conflict
+        conflict_resident = resident_bookings.find_one({
+            "requiresHall": True,
+            "hallName": data["hallName"],
+            "eventStartDate": {"$lte": hall_end},
+            "eventEndDate": {"$gte": hall_start}
+        })
+
+        if conflict_resident:
+            return jsonify({
+                "error": "Hall booked by resident",
+                "residentName": conflict_resident.get("residentName"),
+                "eventTitle": conflict_resident.get("title"),
+            }), 409
+
+    # ---------------- Create Event ----------------
+    event_id = generate_event_id(data["title"])
+
+    doc = {
         "event_id": event_id,
-        "event_title": event_title,
-        "description": description,
-        "event_date": event_date,
-        "event_time": event_time,
-        "requires_community_hall": requires_hall,
+        "title": data["title"],
+        "description": data.get("description", ""),
+        "isMultiDay": is_multi,
+        "eventStartDate": start_date,
+        "eventEndDate": end_date,
+        "eventStartTime": data["eventStartTime"],
+        "eventEndTime": data["eventEndTime"],
+        "requiresHall": requires_hall,
+        "status": "pending",
         "created_by": created_by,
         "created_at": datetime.utcnow(),
         "updated_by": created_by,
         "updated_at": datetime.utcnow(),
-        "status": "pending",
     }
 
     if requires_hall:
-        event_data["hall_name"] = data.get("hall_name", "")
-        event_data["hall_timings"] = data.get("hall_timings", "")
-        event_data["notes"] = data.get("notes", "")
+        doc.update({
+            "hallName": data["hallName"],
+            "hallNotes": data.get("hallNotes", ""),
+            "hallStartDate": data.get("hallStartDate") or start_date,
+            "hallEndDate": data.get("hallEndDate") or end_date,
+            "hallStartTime": data["hallStartTime"],
+            "hallEndTime": data["hallEndTime"],
+        })
 
-    result = events_collection.insert_one(event_data)
+    events_collection.insert_one(doc)
 
-    return jsonify({
-        "message": "Admin event created successfully",
-        "event_id": event_id
-    }), 201
+    return jsonify({"message": "Admin Event Created", "event_id": event_id}), 201
 
 
 
-# ---------------- GET ALL EVENTS ----------------
+# ============================================================================
+# ✅ GET ALL EVENTS
+# ============================================================================
 @adminevents.route("/list", methods=["GET"])
-def get_all_events():
+def get_events():
     events = list(events_collection.find())
-    for event in events:
-        event["_id"] = str(event["_id"])
-    return jsonify({
-        "total_events": len(events),
-        "events": events
-    }), 200
-
-# ---------------- GET EVENT BY CUSTOM ID ----------------
-@adminevents.route("/<event_id>", methods=["GET"])
-def get_event(event_id):
-    try:
-        # First try custom event_id
-        event = events_collection.find_one({"event_id": event_id})
-
-        # Fallback: Try ObjectId
-        if not event:
-            try:
-                object_id = ObjectId(event_id)
-                event = events_collection.find_one({"_id": object_id})
-            except bson_errors.InvalidId:
-                return jsonify({"error": "Invalid event ID format"}), 400
-
-        if not event:
-            return jsonify({"error": "Event not found"}), 404
-
-        event["_id"] = str(event["_id"])
-        return jsonify(event), 200
-
-    except Exception as e:
-        print("❌ Error fetching event:", e)
-        return jsonify({"error": "Server error fetching event"}), 500
+    for e in events:
+        e["_id"] = str(e["_id"])
+    return jsonify({"events": events}), 200
 
 
 
+# ============================================================================
+# ✅ GET SINGLE EVENT
+# ============================================================================
+@adminevents.route("/<id>", methods=["GET"])
+def get_event(id):
+    event = events_collection.find_one({"event_id": id}) or \
+            events_collection.find_one({"_id": ObjectId(id)})
 
-# ---------------- UPDATE EVENT BY CUSTOM ID ----------------
-@adminevents.route("/update/<event_id>", methods=["PUT"])
-def update_event(event_id):
-    try:
-        data = request.get_json()
+    if not event:
+        return jsonify({"error": "Event not found"}), 404
 
-        # ✅ Get updater email from session
-        updated_by = "System"
-        if "user" in session:
-            user = session.get("user")
-            updated_by = user.get("email", "Unknown")
-
-        data["updated_at"] = datetime.utcnow()
-        data["updated_by"] = updated_by
-
-        # Try to update by event_id first
-        result = events_collection.update_one(
-            {"event_id": event_id},
-            {"$set": data}
-        )
-
-        # Fallback: Try ObjectId if no match
-        if result.matched_count == 0:
-            try:
-                object_id = ObjectId(event_id)
-                result = events_collection.update_one(
-                    {"_id": object_id}, {"$set": data}
-                )
-            except bson_errors.InvalidId:
-                return jsonify({"error": "Invalid event ID format"}), 400
-
-        if result.matched_count == 0:
-            return jsonify({"error": "Event not found"}), 404
-
-        return jsonify({"message": "Event updated successfully"}), 200
-
-    except Exception as e:
-        print("❌ Error updating event:", e)
-        return jsonify({"error": "Server error updating event"}), 500
+    event["_id"] = str(event["_id"])
+    return jsonify(event), 200
 
 
-# ---------------- DELETE EVENT BY CUSTOM ID ----------------
-@adminevents.route("/delete/<event_id>", methods=["DELETE"])
-def delete_event(event_id):
-    try:
-        print(f"➡️ Attempting to delete event with ID: {event_id}")
 
-        # Try delete by custom event_id first
-        result = events_collection.delete_one({"event_id": event_id})
+# ============================================================================
+# ✅ UPDATE EVENT (SAFE UPDATE + MERGE OLD + NEW)
+# ============================================================================
+@adminevents.route("/update/<id>", methods=["PUT"])
+def update_event(id):
+    new = request.get_json()
 
-        # Fallback: Try by MongoDB ObjectId
-        if result.deleted_count == 0:
-            try:
-                object_id = ObjectId(event_id)
-                result = events_collection.delete_one({"_id": object_id})
-            except bson_errors.InvalidId:
-                print("❌ Invalid event ID format")
-                return jsonify({"error": "Invalid event ID format"}), 400
+    # --- Fetch existing event ---
+    old = events_collection.find_one({"_id": ObjectId(id)})
+    if not old:
+        return jsonify({"error": "Event not found"}), 404
 
-        if result.deleted_count == 0:
-            print("❌ Event not found")
-            return jsonify({"error": "Event not found"}), 404
+    # --- Merge old + new values ---
+    data = {**old, **new}
 
-        print(f"✅ Event {event_id} deleted successfully")
-        return jsonify({"message": "Event deleted successfully"}), 200
+    is_multi = data.get("isMultiDay", False)
+    requires_hall = data.get("requiresHall", False)
 
-    except Exception as e:
-        print("❌ Error deleting event:", e)
-        return jsonify({"error": "Server error while deleting event"}), 500
+    start_date = data.get("eventStartDate")
+    end_date = data.get("eventEndDate") if is_multi else start_date
+
+    # Update metadata
+    data["updated_by"] = session.get("user", {}).get("email", "System")
+    data["updated_at"] = datetime.utcnow()
+
+    # ---------------- HALL VALIDATION ----------------
+    if requires_hall:
+
+        hall_start = data.get("hallStartDate") or start_date
+        hall_end = data.get("hallEndDate") or end_date
+
+        if not data.get("hallName"):
+            return jsonify({"error": "hallName required"}), 400
+
+        # Check resident conflict
+        conflict_resident = resident_bookings.find_one({
+            "requiresHall": True,
+            "hallName": data["hallName"],
+            "eventStartDate": {"$lte": hall_end},
+            "eventEndDate": {"$gte": hall_start},
+        })
+
+        if conflict_resident:
+            return jsonify({
+                "error": "Hall booked by resident",
+                "eventTitle": conflict_resident.get("title"),
+                "residentName": conflict_resident.get("residentName"),
+            }), 409
+
+        # Check admin conflict excluding self
+        conflict_admin = events_collection.find_one({
+            "_id": {"$ne": ObjectId(id)},
+            "requiresHall": True,
+            "hallName": data["hallName"],
+            "eventStartDate": {"$lte": hall_end},
+            "eventEndDate": {"$gte": hall_start},
+        })
+
+        if conflict_admin:
+            return jsonify({
+                "error": "Hall booked by admin",
+                "eventTitle": conflict_admin.get("title"),
+            }), 409
+
+    # ---------------- UPDATE EVENT ----------------
+    data["_id"] = ObjectId(id)
+    events_collection.replace_one({"_id": ObjectId(id)}, data)
+
+    return jsonify({"message": "Event updated"}), 200
 
 
+
+# ============================================================================
+# ✅ DELETE EVENT
+# ============================================================================
+@adminevents.route("/delete/<id>", methods=["DELETE"])
+def delete_event(id):
+    result = events_collection.delete_one({"_id": ObjectId(id)})
+
+    if result.deleted_count == 0:
+        return jsonify({"error": "Event not found"}), 404
+
+    return jsonify({"message": "Event deleted"}), 200

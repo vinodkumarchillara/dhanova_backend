@@ -1,9 +1,0 @@
-db.users.insertOne({
-  "_id": ObjectId("67212abcf9a6e8b32d2b3e4c"),
-  "username": "charan",
-  "firstname": "charan",
-  "email": "charanteja@gmail.com",
-  "phone": "8497920031",
-  "password": "$2b$12$fGsF1aHN28E/Vn56rWjq1u/gPOChcqyK./fzB0jmQlJAw6OFlVZmO",
-  "role": "admin"
-})
